@@ -1,0 +1,237 @@
+<!doctype html>
+<html lang="ja">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>ESP32 Nav Bridge</title>
+<style>
+  :root { color-scheme: dark; }
+  body { margin:0; padding:16px; font:16px/1.5 -apple-system,sans-serif;
+         background:#111; color:#eee; }
+  h1 { font-size:18px; margin:0 0 12px; }
+  input, button { font-size:16px; padding:10px; border-radius:8px;
+         border:1px solid #444; background:#1c1c1c; color:#eee; box-sizing:border-box; }
+  input { width:100%; margin-bottom:8px; }
+  button { width:100%; margin-bottom:8px; background:#2a5db0; border-color:#2a5db0; }
+  button:disabled { opacity:.4; }
+  button.sec { background:#1c1c1c; border-color:#444; }
+  #log { font:12px/1.4 ui-monospace,monospace; background:#000; color:#6f6;
+         padding:8px; border-radius:8px; height:130px; overflow:auto; white-space:pre-wrap; }
+  #hud { background:#000; border-radius:12px; padding:16px; text-align:center; margin:12px 0; }
+  #arrow { font-size:64px; line-height:1; }
+  #dist  { font-size:40px; font-weight:700; }
+  #road  { color:#6cf; }
+  #eta   { color:#888; font-size:14px; }
+  .row { display:flex; gap:8px; }
+  .row > * { flex:1; }
+  small { color:#888; }
+</style>
+
+<h1>ESP32 Nav Bridge</h1>
+
+<input id="token" placeholder="Mapbox access token (pk....)">
+<input id="dest"  placeholder="目的地（例: 名古屋駅）">
+
+<div class="row">
+  <button id="btnBle">1. ESP32に接続</button>
+  <button id="btnGo" disabled>2. ナビ開始</button>
+</div>
+<div class="row">
+  <button id="btnStop" class="sec" disabled>停止</button>
+  <button id="btnTest" class="sec">テスト送信</button>
+</div>
+
+<div id="hud">
+  <div id="arrow">–</div>
+  <div id="dist">--</div>
+  <div id="road">&nbsp;</div>
+  <div id="eta">&nbsp;</div>
+</div>
+
+<div id="log"></div>
+<p><small>Bluefy で HTTPS 配信されたこのページを開いてください。file:// では動きません。</small></p>
+
+<script>
+const SVC = '7a0b1000-5f3e-4c2a-9d71-8e6f0a1b2c3d';
+const CHR = '7a0b1001-5f3e-4c2a-9d71-8e6f0a1b2c3d';
+
+const T = { STRAIGHT:0, SLIGHT_R:1, RIGHT:2, SHARP_R:3, UTURN:4,
+            SHARP_L:5, LEFT:6, SLIGHT_L:7, ARRIVE:8, DEPART:9, ROUNDABOUT:10 };
+const GLYPH = ['↑','↗','→','↘','↓','↙','←','↖','🏁','▲','◎'];
+
+const $ = id => document.getElementById(id);
+const log = m => { const l = $('log'); l.textContent += m + '\n'; l.scrollTop = 1e9; };
+
+/* ---------- BLE ---------- */
+let chr = null, dev = null, busy = false;
+
+async function bleConnect() {
+  dev = await navigator.bluetooth.requestDevice({ filters:[{ services:[SVC] }] });
+  dev.addEventListener('gattserverdisconnected', () => { chr = null; log('BLE 切断'); });
+  const svc = await (await dev.gatt.connect()).getPrimaryService(SVC);
+  chr = await svc.getCharacteristic(CHR);
+  log('BLE 接続: ' + (dev.name || dev.id));
+}
+
+function utf8Trunc(s, max) {
+  const b = new TextEncoder().encode(s);
+  if (b.length <= max) return b;
+  let n = max;
+  while (n > 0 && (b[n] & 0xC0) === 0x80) n--;   // 多バイト文字の途中で切らない
+  return b.slice(0, n);
+}
+
+async function send(turn, dist, eta, road) {
+  if (!chr || busy) return;
+  busy = true;
+  try {
+    const nb  = utf8Trunc(road || '', 26);
+    const buf = new Uint8Array(5 + nb.length);
+    const dv  = new DataView(buf.buffer);
+    dv.setUint8(0, turn);
+    dv.setUint16(1, Math.min(65535, Math.round(dist)), true);
+    dv.setUint16(3, Math.min(65535, Math.round(eta)),  true);
+    buf.set(nb, 5);
+    if (chr.properties && chr.properties.writeWithoutResponse)
+      await chr.writeValueWithoutResponse(buf);
+    else
+      await chr.writeValue(buf);
+  } catch (e) { log('送信失敗: ' + e.message); }
+  busy = false;
+}
+
+/* ---------- 幾何 ---------- */
+const R = 6371000;
+const rad = d => d * Math.PI / 180;
+function hav(a, b) {                     // a,b = [lon,lat]
+  const dLat = rad(b[1] - a[1]), dLon = rad(b[0] - a[0]);
+  const s = Math.sin(dLat / 2) ** 2 +
+            Math.cos(rad(a[1])) * Math.cos(rad(b[1])) * Math.sin(dLon / 2) ** 2;
+  return 2 * R * Math.asin(Math.sqrt(s));
+}
+
+function turnCode(m) {
+  if (m.type === 'arrive') return T.ARRIVE;
+  if (m.type === 'depart') return T.DEPART;
+  if (m.type === 'rotary' || m.type.startsWith('roundabout')) return T.ROUNDABOUT;
+  return ({ 'sharp right':T.SHARP_R, 'right':T.RIGHT, 'slight right':T.SLIGHT_R,
+            'straight':T.STRAIGHT, 'uturn':T.UTURN,
+            'slight left':T.SLIGHT_L, 'left':T.LEFT, 'sharp left':T.SHARP_L
+          })[m.modifier] ?? T.STRAIGHT;
+}
+
+/* ---------- ルート ---------- */
+let steps = [], coords = [], idx = 0, watchId = null, lastReroute = 0, wakeLock = null;
+
+async function geocode(q, token) {
+  const u = 'https://api.mapbox.com/geocoding/v5/mapbox.places/'
+          + encodeURIComponent(q) + '.json'
+          + '?language=ja&limit=1&country=jp&access_token=' + token;
+  const j = await (await fetch(u)).json();
+  if (!j.features || !j.features.length) throw new Error('目的地が見つかりません');
+  return j.features[0].center;                    // [lon,lat]
+}
+
+async function route(from, to, token) {
+  const u = 'https://api.mapbox.com/directions/v5/mapbox/driving/'
+          + from[0] + ',' + from[1] + ';' + to[0] + ',' + to[1]
+          + '?steps=true&geometries=geojson&overview=full&language=ja&access_token=' + token;
+  const j = await (await fetch(u)).json();
+  if (!j.routes || !j.routes.length) throw new Error('経路が引けません');
+  const r = j.routes[0];
+  steps  = r.legs[0].steps;
+  coords = r.geometry.coordinates;
+  idx    = 0;
+  log('経路取得: ' + (r.distance / 1000).toFixed(1) + 'km / '
+      + Math.round(r.duration / 60) + '分 / ' + steps.length + 'ステップ');
+}
+
+function offRoute(pos) {
+  let min = Infinity;
+  for (const c of coords) { const d = hav(pos, c); if (d < min) min = d; }
+  return min > 80;
+}
+
+function hud(turn, dist, eta, road) {
+  $('arrow').textContent = GLYPH[turn] ?? '–';
+  $('dist').textContent  = dist >= 1000 ? (dist / 1000).toFixed(1) + 'km' : Math.round(dist) + 'm';
+  $('road').textContent  = road || ' ';
+  $('eta').textContent   = eta + ' 分';
+}
+
+function onFix(p) {
+  const pos = [p.coords.longitude, p.coords.latitude];
+
+  if (offRoute(pos) && Date.now() - lastReroute > 15000) {
+    lastReroute = Date.now();
+    log('ルート外 → 再探索');
+    const dst = steps[steps.length - 1].maneuver.location;
+    route(pos, dst, $('token').value.trim()).catch(e => log(e.message));
+    return;
+  }
+
+  // 次の曲がり角は steps[idx+1] の maneuver 位置にある
+  while (idx + 1 < steps.length &&
+         hav(pos, steps[idx + 1].maneuver.location) < 25) idx++;
+
+  const nxt  = steps[Math.min(idx + 1, steps.length - 1)];
+  const dist = hav(pos, nxt.maneuver.location);
+  let sec = 0;
+  for (let i = idx; i < steps.length; i++) sec += steps[i].duration;
+  const eta  = Math.max(0, Math.round(sec / 60));
+  const code = turnCode(nxt.maneuver);
+  const road = nxt.name || '';
+
+  hud(code, dist, eta, road);
+  send(code, dist, eta, road);
+}
+
+/* ---------- UI ---------- */
+$('token').value = localStorage.getItem('mbtok') || '';
+$('dest').value  = localStorage.getItem('dest')  || '';
+
+$('btnBle').onclick = async () => {
+  try { await bleConnect(); $('btnGo').disabled = false; }
+  catch (e) { log('接続失敗: ' + e.message); }
+};
+
+$('btnTest').onclick = () => {
+  hud(T.RIGHT, 180, 12, 'テスト通り');
+  send(T.RIGHT, 180, 12, 'テスト通り');
+};
+
+$('btnGo').onclick = async () => {
+  const token = $('token').value.trim(), dest = $('dest').value.trim();
+  if (!token || !dest) return log('token と目的地を入れてください');
+  localStorage.setItem('mbtok', token);
+  localStorage.setItem('dest', dest);
+  try {
+    const here = await new Promise((res, rej) =>
+      navigator.geolocation.getCurrentPosition(res, rej,
+        { enableHighAccuracy:true, timeout:15000 }));
+    const from = [here.coords.longitude, here.coords.latitude];
+    const to   = await geocode(dest, token);
+    await route(from, to, token);
+
+    try { wakeLock = await navigator.wakeLock.request('screen'); log('画面ロック抑止 ON'); }
+    catch (e) { log('wakeLock 不可 → 設定で自動ロックをオフに'); }
+
+    watchId = navigator.geolocation.watchPosition(onFix,
+                e => log('GPS: ' + e.message),
+                { enableHighAccuracy:true, maximumAge:1000, timeout:20000 });
+    $('btnStop').disabled = false;
+    $('btnGo').disabled   = true;
+    log('ナビ開始');
+  } catch (e) { log('エラー: ' + e.message); }
+};
+
+$('btnStop').onclick = () => {
+  if (watchId !== null) navigator.geolocation.clearWatch(watchId);
+  watchId = null;
+  if (wakeLock) { wakeLock.release(); wakeLock = null; }
+  send(255, 0, 0, '');
+  $('btnStop').disabled = true;
+  $('btnGo').disabled   = false;
+  log('停止');
+};
+</script>
+</html>
