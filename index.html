@@ -7,7 +7,8 @@
   :root { color-scheme: dark; }
   body { margin:0; padding:16px; font:16px/1.5 -apple-system,sans-serif;
          background:#111; color:#eee; }
-  h1 { font-size:18px; margin:0 0 12px; }
+  h1 { font-size:18px; margin:0 0 4px; }
+  .sub { color:#888; font-size:12px; margin:0 0 12px; }
   input, button { font-size:16px; padding:10px; border-radius:8px;
          border:1px solid #444; background:#1c1c1c; color:#eee; box-sizing:border-box; }
   input { width:100%; margin-bottom:8px; }
@@ -23,13 +24,17 @@
   #eta   { color:#888; font-size:14px; }
   .row { display:flex; gap:8px; }
   .row > * { flex:1; }
+  details { margin:8px 0; }
+  summary { color:#888; font-size:14px; }
   small { color:#888; }
+  footer { color:#666; font-size:11px; margin-top:16px; }
+  a { color:#6cf; }
 </style>
 
 <h1>ESP32 Nav Bridge</h1>
+<p class="sub">OSRM + Nominatim（APIキー不要）</p>
 
-<input id="token" placeholder="Mapbox access token (pk....)">
-<input id="dest"  placeholder="目的地（例: 名古屋駅）">
+<input id="dest" placeholder="目的地（例: 名古屋駅）">
 
 <div class="row">
   <button id="btnBle">1. ESP32に接続</button>
@@ -48,11 +53,27 @@
 </div>
 
 <div id="log"></div>
+
+<details>
+  <summary>詳細設定</summary>
+  <p><small>経路サーバ（OSRM互換）。自前で立てた場合はここを書き換えます。</small></p>
+  <input id="osrm" placeholder="https://router.project-osrm.org">
+</details>
+
 <p><small>Bluefy で HTTPS 配信されたこのページを開いてください。file:// では動きません。</small></p>
+<footer>
+  経路・地名データ © <a href="https://www.openstreetmap.org/copyright">OpenStreetMap contributors</a>（ODbL）。
+  経路探索は <a href="http://project-osrm.org/">OSRM</a> の公開サーバ、地名検索は
+  <a href="https://nominatim.org/">Nominatim</a> を利用しています。いずれも公共の無償サービスのため、
+  連続した大量アクセスは行わないでください。
+</footer>
 
 <script>
 const SVC = '7a0b1000-5f3e-4c2a-9d71-8e6f0a1b2c3d';
 const CHR = '7a0b1001-5f3e-4c2a-9d71-8e6f0a1b2c3d';
+
+const OSRM_DEFAULT = 'https://router.project-osrm.org';
+const NOMINATIM    = 'https://nominatim.openstreetmap.org/search';
 
 const T = { STRAIGHT:0, SLIGHT_R:1, RIGHT:2, SHARP_R:3, UTURN:4,
             SHARP_L:5, LEFT:6, SLIGHT_L:7, ARRIVE:8, DEPART:9, ROUNDABOUT:10 };
@@ -109,6 +130,7 @@ function hav(a, b) {                     // a,b = [lon,lat]
   return 2 * R * Math.asin(Math.sqrt(s));
 }
 
+// OSRM の maneuver は Mapbox Directions と同じ語彙
 function turnCode(m) {
   if (m.type === 'arrive') return T.ARRIVE;
   if (m.type === 'depart') return T.DEPART;
@@ -119,30 +141,41 @@ function turnCode(m) {
           })[m.modifier] ?? T.STRAIGHT;
 }
 
-/* ---------- ルート ---------- */
-let steps = [], coords = [], idx = 0, watchId = null, lastReroute = 0, wakeLock = null;
+/* ---------- 経路 ---------- */
+let steps = [], coords = [], idx = 0, minD = Infinity;
+let watchId = null, lastReroute = 0, wakeLock = null, dest = null;
 
-async function geocode(q, token) {
-  const u = 'https://api.mapbox.com/geocoding/v5/mapbox.places/'
-          + encodeURIComponent(q) + '.json'
-          + '?language=ja&limit=1&country=jp&access_token=' + token;
-  const j = await (await fetch(u)).json();
-  if (!j.features || !j.features.length) throw new Error('目的地が見つかりません');
-  return j.features[0].center;                    // [lon,lat]
+const osrmBase = () => ($('osrm').value.trim() || OSRM_DEFAULT).replace(/\/+$/, '');
+
+// Nominatim は「1秒に1リクエストまで」の利用規約。出発時の1回だけ呼ぶ
+async function geocode(q) {
+  const u = NOMINATIM + '?q=' + encodeURIComponent(q)
+          + '&format=jsonv2&limit=1&countrycodes=jp&accept-language=ja';
+  const r = await fetch(u, { headers: { 'Accept': 'application/json' } });
+  if (!r.ok) throw new Error('地名検索に失敗 (' + r.status + ')');
+  const j = await r.json();
+  if (!j.length) throw new Error('目的地が見つかりません');
+  log('目的地: ' + j[0].display_name.split(',').slice(0, 3).join(','));
+  return [parseFloat(j[0].lon), parseFloat(j[0].lat)];
 }
 
-async function route(from, to, token) {
-  const u = 'https://api.mapbox.com/directions/v5/mapbox/driving/'
+async function route(from, to) {
+  const u = osrmBase() + '/route/v1/driving/'
           + from[0] + ',' + from[1] + ';' + to[0] + ',' + to[1]
-          + '?steps=true&geometries=geojson&overview=full&language=ja&access_token=' + token;
-  const j = await (await fetch(u)).json();
-  if (!j.routes || !j.routes.length) throw new Error('経路が引けません');
-  const r = j.routes[0];
-  steps  = r.legs[0].steps;
-  coords = r.geometry.coordinates;
+          + '?steps=true&geometries=geojson&overview=full&annotations=false';
+  const r = await fetch(u);
+  if (!r.ok) throw new Error('経路サーバ応答エラー (' + r.status + ')');
+  const j = await r.json();
+  if (j.code !== 'Ok' || !j.routes || !j.routes.length)
+    throw new Error('経路が引けません (' + (j.code || '?') + ')');
+
+  const rt = j.routes[0];
+  steps  = rt.legs[0].steps;
+  coords = rt.geometry.coordinates;
   idx    = 0;
-  log('経路取得: ' + (r.distance / 1000).toFixed(1) + 'km / '
-      + Math.round(r.duration / 60) + '分 / ' + steps.length + 'ステップ');
+  minD   = Infinity;
+  log('経路取得: ' + (rt.distance / 1000).toFixed(1) + 'km / '
+      + Math.round(rt.duration / 60) + '分 / ' + steps.length + 'ステップ');
 }
 
 function offRoute(pos) {
@@ -151,27 +184,43 @@ function offRoute(pos) {
   return min > 80;
 }
 
+// 区間を進める。「25m以内に入った」だけでなく
+// 「一度50m以内に近づいてから30m以上遠ざかった＝通過した」でも次へ送る
+function advance(pos) {
+  while (idx + 1 < steps.length - 1) {
+    const d = hav(pos, steps[idx + 1].maneuver.location);
+    if (d < minD) minD = d;
+    if (d < 25 || (minD < 50 && d > minD + 30)) { idx++; minD = Infinity; }
+    else break;
+  }
+}
+
+// 日本の細い道は OSM に名前が無いことが多い。その場合は路線番号を出す
+function roadLabel(step) {
+  if (step.name) return step.name;
+  if (step.ref)  return 'R' + step.ref.split(';')[0].trim();
+  return '';
+}
+
 function hud(turn, dist, eta, road) {
   $('arrow').textContent = GLYPH[turn] ?? '–';
   $('dist').textContent  = dist >= 1000 ? (dist / 1000).toFixed(1) + 'km' : Math.round(dist) + 'm';
-  $('road').textContent  = road || ' ';
+  $('road').textContent  = road || ' ';
   $('eta').textContent   = eta + ' 分';
 }
 
 function onFix(p) {
+  if (!steps.length) return;
   const pos = [p.coords.longitude, p.coords.latitude];
 
-  if (offRoute(pos) && Date.now() - lastReroute > 15000) {
+  if (offRoute(pos) && Date.now() - lastReroute > 20000) {
     lastReroute = Date.now();
     log('ルート外 → 再探索');
-    const dst = steps[steps.length - 1].maneuver.location;
-    route(pos, dst, $('token').value.trim()).catch(e => log(e.message));
+    route(pos, dest).catch(e => log(e.message));
     return;
   }
 
-  // 次の曲がり角は steps[idx+1] の maneuver 位置にある
-  while (idx + 1 < steps.length &&
-         hav(pos, steps[idx + 1].maneuver.location) < 25) idx++;
+  advance(pos);
 
   const nxt  = steps[Math.min(idx + 1, steps.length - 1)];
   const dist = hav(pos, nxt.maneuver.location);
@@ -179,15 +228,15 @@ function onFix(p) {
   for (let i = idx; i < steps.length; i++) sec += steps[i].duration;
   const eta  = Math.max(0, Math.round(sec / 60));
   const code = turnCode(nxt.maneuver);
-  const road = nxt.name || '';
+  const road = roadLabel(nxt);
 
   hud(code, dist, eta, road);
   send(code, dist, eta, road);
 }
 
 /* ---------- UI ---------- */
-$('token').value = localStorage.getItem('mbtok') || '';
-$('dest').value  = localStorage.getItem('dest')  || '';
+$('dest').value = localStorage.getItem('dest') || '';
+$('osrm').value = localStorage.getItem('osrm') || '';
 
 $('btnBle').onclick = async () => {
   try { await bleConnect(); $('btnGo').disabled = false; }
@@ -200,17 +249,19 @@ $('btnTest').onclick = () => {
 };
 
 $('btnGo').onclick = async () => {
-  const token = $('token').value.trim(), dest = $('dest').value.trim();
-  if (!token || !dest) return log('token と目的地を入れてください');
-  localStorage.setItem('mbtok', token);
-  localStorage.setItem('dest', dest);
+  const q = $('dest').value.trim();
+  if (!q) return log('目的地を入れてください');
+  localStorage.setItem('dest', q);
+  localStorage.setItem('osrm', $('osrm').value.trim());
+
+  $('btnGo').disabled = true;
   try {
     const here = await new Promise((res, rej) =>
       navigator.geolocation.getCurrentPosition(res, rej,
         { enableHighAccuracy:true, timeout:15000 }));
     const from = [here.coords.longitude, here.coords.latitude];
-    const to   = await geocode(dest, token);
-    await route(from, to, token);
+    dest = await geocode(q);
+    await route(from, dest);
 
     try { wakeLock = await navigator.wakeLock.request('screen'); log('画面ロック抑止 ON'); }
     catch (e) { log('wakeLock 不可 → 設定で自動ロックをオフに'); }
@@ -219,15 +270,18 @@ $('btnGo').onclick = async () => {
                 e => log('GPS: ' + e.message),
                 { enableHighAccuracy:true, maximumAge:1000, timeout:20000 });
     $('btnStop').disabled = false;
-    $('btnGo').disabled   = true;
     log('ナビ開始');
-  } catch (e) { log('エラー: ' + e.message); }
+  } catch (e) {
+    log('エラー: ' + e.message);
+    $('btnGo').disabled = false;
+  }
 };
 
 $('btnStop').onclick = () => {
   if (watchId !== null) navigator.geolocation.clearWatch(watchId);
   watchId = null;
   if (wakeLock) { wakeLock.release(); wakeLock = null; }
+  steps = []; coords = [];
   send(255, 0, 0, '');
   $('btnStop').disabled = true;
   $('btnGo').disabled   = false;
