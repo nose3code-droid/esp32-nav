@@ -15,6 +15,8 @@
   button { width:100%; margin-bottom:8px; background:#2a5db0; border-color:#2a5db0; }
   button:disabled { opacity:.4; }
   button.sec { background:#1c1c1c; border-color:#444; }
+  button.mode { background:#1c1c1c; border-color:#444; font-size:14px; padding:8px 4px; }
+  button.mode[aria-pressed="true"] { background:#2a5db0; border-color:#2a5db0; }
   #log { font:12px/1.4 ui-monospace,monospace; background:#000; color:#6f6;
          padding:8px; border-radius:8px; height:130px; overflow:auto; white-space:pre-wrap; }
   #hud { background:#000; border-radius:12px; padding:16px; text-align:center; margin:12px 0; }
@@ -24,6 +26,7 @@
   #eta   { color:#888; font-size:14px; }
   .row { display:flex; gap:8px; }
   .row > * { flex:1; }
+  .label { color:#888; font-size:12px; margin:4px 0; }
   details { margin:8px 0; }
   summary { color:#888; font-size:14px; }
   small { color:#888; }
@@ -32,9 +35,16 @@
 </style>
 
 <h1>ESP32 Nav Bridge</h1>
-<p class="sub">OSRM + Nominatim（APIキー不要）</p>
+<p class="sub">Valhalla + Nominatim（APIキー不要）</p>
 
 <input id="dest" placeholder="目的地（例: 名古屋駅）">
+
+<p class="label">経路の種類</p>
+<div class="row">
+  <button class="mode" id="mHwy"  aria-pressed="true">高速あり</button>
+  <button class="mode" id="mToll" aria-pressed="false">有料回避</button>
+  <button class="mode" id="mLoc"  aria-pressed="false">下道優先</button>
+</div>
 
 <div class="row">
   <button id="btnBle">1. ESP32に接続</button>
@@ -56,24 +66,26 @@
 
 <details>
   <summary>詳細設定</summary>
-  <p><small>経路サーバ（OSRM互換）。自前で立てた場合はここを書き換えます。</small></p>
-  <input id="osrm" placeholder="https://router.project-osrm.org">
+  <p><small>経路サーバ（Valhalla互換）。自前で立てた場合はここを書き換えます。</small></p>
+  <input id="valhalla" placeholder="https://valhalla1.openstreetmap.de">
 </details>
 
 <p><small>Bluefy で HTTPS 配信されたこのページを開いてください。file:// では動きません。</small></p>
 <footer>
   経路・地名データ © <a href="https://www.openstreetmap.org/copyright">OpenStreetMap contributors</a>（ODbL）。
-  経路探索は <a href="http://project-osrm.org/">OSRM</a> の公開サーバ、地名検索は
+  経路探索は <a href="https://valhalla.github.io/valhalla/">Valhalla</a>（FOSSGIS 公開サーバ）、地名検索は
   <a href="https://nominatim.org/">Nominatim</a> を利用しています。いずれも公共の無償サービスのため、
-  連続した大量アクセスは行わないでください。
+  連続した大量アクセスは行わないでください。<br>
+  「有料回避」「下道優先」は Valhalla の重み付け（優先度）です。禁止ではないため、
+  他に道が無ければ高速や有料区間を通ることがあります。
 </footer>
 
 <script>
 const SVC = '7a0b1000-5f3e-4c2a-9d71-8e6f0a1b2c3d';
 const CHR = '7a0b1001-5f3e-4c2a-9d71-8e6f0a1b2c3d';
 
-const OSRM_DEFAULT = 'https://router.project-osrm.org';
-const NOMINATIM    = 'https://nominatim.openstreetmap.org/search';
+const VALHALLA_DEFAULT = 'https://valhalla1.openstreetmap.de';
+const NOMINATIM        = 'https://nominatim.openstreetmap.org/search';
 
 const T = { STRAIGHT:0, SLIGHT_R:1, RIGHT:2, SHARP_R:3, UTURN:4,
             SHARP_L:5, LEFT:6, SLIGHT_L:7, ARRIVE:8, DEPART:9, ROUNDABOUT:10 };
@@ -130,22 +142,54 @@ function hav(a, b) {                     // a,b = [lon,lat]
   return 2 * R * Math.asin(Math.sqrt(s));
 }
 
-// OSRM の maneuver は Mapbox Directions と同じ語彙
-function turnCode(m) {
-  if (m.type === 'arrive') return T.ARRIVE;
-  if (m.type === 'depart') return T.DEPART;
-  if (m.type === 'rotary' || m.type.startsWith('roundabout')) return T.ROUNDABOUT;
-  return ({ 'sharp right':T.SHARP_R, 'right':T.RIGHT, 'slight right':T.SLIGHT_R,
-            'straight':T.STRAIGHT, 'uturn':T.UTURN,
-            'slight left':T.SLIGHT_L, 'left':T.LEFT, 'sharp left':T.SHARP_L
-          })[m.modifier] ?? T.STRAIGHT;
+// Valhalla の shape は Encoded Polyline だが精度が 1e6（Google 形式は 1e5）
+function decodeShape(str, factor) {
+  let i = 0, lat = 0, lon = 0;
+  const out = [];
+  while (i < str.length) {
+    let b, shift = 0, res = 0;
+    do { b = str.charCodeAt(i++) - 63; res |= (b & 0x1f) << shift; shift += 5; } while (b >= 0x20);
+    lat += (res & 1) ? ~(res >> 1) : (res >> 1);
+    shift = 0; res = 0;
+    do { b = str.charCodeAt(i++) - 63; res |= (b & 0x1f) << shift; shift += 5; } while (b >= 0x20);
+    lon += (res & 1) ? ~(res >> 1) : (res >> 1);
+    out.push([lon / factor, lat / factor]);   // 以降 [lon,lat] で統一
+  }
+  return out;
 }
+
+// Valhalla の maneuver.type は数値。OSRM(Mapbox語彙)とは別物なので変換する
+const VTURN = {
+  0:T.STRAIGHT,                                  // none
+  1:T.DEPART,  2:T.DEPART,  3:T.DEPART,          // start / start right / start left
+  4:T.ARRIVE,  5:T.ARRIVE,  6:T.ARRIVE,          // destination
+  7:T.STRAIGHT, 8:T.STRAIGHT,                    // becomes / continue
+  9:T.SLIGHT_R, 10:T.RIGHT, 11:T.SHARP_R,
+  12:T.UTURN,  13:T.UTURN,
+  14:T.SHARP_L, 15:T.LEFT, 16:T.SLIGHT_L,
+  17:T.STRAIGHT, 18:T.SLIGHT_R, 19:T.SLIGHT_L,   // ramp straight / right / left
+  20:T.SLIGHT_R, 21:T.SLIGHT_L,                  // exit right / left
+  22:T.STRAIGHT, 23:T.SLIGHT_R, 24:T.SLIGHT_L,   // stay straight / right / left
+  25:T.STRAIGHT,                                 // merge
+  26:T.ROUNDABOUT, 27:T.ROUNDABOUT,
+  28:T.STRAIGHT, 29:T.STRAIGHT,                  // ferry
+  37:T.SLIGHT_R, 38:T.SLIGHT_L                   // merge right / left
+};
+const turnCode = m => VTURN[m.type] ?? T.STRAIGHT;
 
 /* ---------- 経路 ---------- */
 let steps = [], coords = [], idx = 0, minD = Infinity;
 let watchId = null, lastReroute = 0, wakeLock = null, dest = null;
+let mode = 'hwy';   // hwy | toll | local
 
-const osrmBase = () => ($('osrm').value.trim() || OSRM_DEFAULT).replace(/\/+$/, '');
+const vBase = () => ($('valhalla').value.trim() || VALHALLA_DEFAULT).replace(/\/+$/, '');
+
+// 「禁止」ではなく重み付け。0 に近いほど避ける
+function costing() {
+  if (mode === 'toll')  return { use_tolls: 0 };
+  if (mode === 'local') return { use_highways: 0, use_tolls: 0 };
+  return {};
+}
 
 // Nominatim は「1秒に1リクエストまで」の利用規約。出発時の1回だけ呼ぶ
 async function geocode(q) {
@@ -160,22 +204,30 @@ async function geocode(q) {
 }
 
 async function route(from, to) {
-  const u = osrmBase() + '/route/v1/driving/'
-          + from[0] + ',' + from[1] + ';' + to[0] + ',' + to[1]
-          + '?steps=true&geometries=geojson&overview=full&annotations=false';
-  const r = await fetch(u);
-  if (!r.ok) throw new Error('経路サーバ応答エラー (' + r.status + ')');
-  const j = await r.json();
-  if (j.code !== 'Ok' || !j.routes || !j.routes.length)
-    throw new Error('経路が引けません (' + (j.code || '?') + ')');
+  const q = {
+    locations: [ { lat:from[1], lon:from[0] }, { lat:to[1], lon:to[0] } ],
+    costing: 'auto',
+    costing_options: { auto: costing() },
+    directions_options: { language: 'ja-JP', units: 'kilometers' }
+  };
+  const r = await fetch(vBase() + '/route?json=' + encodeURIComponent(JSON.stringify(q)));
+  const j = await r.json().catch(() => null);
+  if (!j) throw new Error('経路サーバ応答エラー (' + r.status + ')');
+  if (j.error) throw new Error('経路が引けません: ' + j.error);
+  if (!j.trip || !j.trip.legs || !j.trip.legs.length) throw new Error('経路が空です');
 
-  const rt = j.routes[0];
-  steps  = rt.legs[0].steps;
-  coords = rt.geometry.coordinates;
-  idx    = 0;
-  minD   = Infinity;
-  log('経路取得: ' + (rt.distance / 1000).toFixed(1) + 'km / '
-      + Math.round(rt.duration / 60) + '分 / ' + steps.length + 'ステップ');
+  const leg = j.trip.legs[0];
+  coords = decodeShape(leg.shape, 1e6);
+  steps  = leg.maneuvers;
+  // maneuver の座標は直接は入っておらず、shape のインデックスで示される
+  for (const m of steps)
+    m.loc = coords[Math.min(m.begin_shape_index, coords.length - 1)];
+  idx  = 0;
+  minD = Infinity;
+
+  const s = j.trip.summary;
+  log('経路取得[' + MODE_NAME[mode] + ']: ' + s.length.toFixed(1) + 'km / '
+      + Math.round(s.time / 60) + '分 / ' + steps.length + 'ステップ');
 }
 
 function offRoute(pos) {
@@ -188,18 +240,23 @@ function offRoute(pos) {
 // 「一度50m以内に近づいてから30m以上遠ざかった＝通過した」でも次へ送る
 function advance(pos) {
   while (idx + 1 < steps.length - 1) {
-    const d = hav(pos, steps[idx + 1].maneuver.location);
+    const d = hav(pos, steps[idx + 1].loc);
     if (d < minD) minD = d;
     if (d < 25 || (minD < 50 && d > minD + 30)) { idx++; minD = Infinity; }
     else break;
   }
 }
 
-// 日本の細い道は OSM に名前が無いことが多い。その場合は路線番号を出す
-function roadLabel(step) {
-  if (step.name) return step.name;
-  if (step.ref)  return 'R' + step.ref.split(';')[0].trim();
-  return '';
+// street_names は ['名古屋豊田線','nagoya-toyota line','58'] のように
+// 日本語名・英語名・路線番号が混ざる。日本語名を優先し、無ければ番号を出す
+function roadLabel(m) {
+  const ns = m.street_names || m.begin_street_names || [];
+  if (!ns.length) return '';
+  const ja = ns.find(s => /[^\x00-\x7F]/.test(s));
+  if (ja) return ja;
+  const num = ns.find(s => /^\d+$/.test(s));
+  if (num) return 'R' + num;
+  return ns[0];
 }
 
 function hud(turn, dist, eta, road) {
@@ -223,11 +280,11 @@ function onFix(p) {
   advance(pos);
 
   const nxt  = steps[Math.min(idx + 1, steps.length - 1)];
-  const dist = hav(pos, nxt.maneuver.location);
+  const dist = hav(pos, nxt.loc);
   let sec = 0;
-  for (let i = idx; i < steps.length; i++) sec += steps[i].duration;
+  for (let i = idx; i < steps.length; i++) sec += steps[i].time;
   const eta  = Math.max(0, Math.round(sec / 60));
-  const code = turnCode(nxt.maneuver);
+  const code = turnCode(nxt);
   const road = roadLabel(nxt);
 
   hud(code, dist, eta, road);
@@ -235,8 +292,27 @@ function onFix(p) {
 }
 
 /* ---------- UI ---------- */
-$('dest').value = localStorage.getItem('dest') || '';
-$('osrm').value = localStorage.getItem('osrm') || '';
+const MODE_NAME = { hwy:'高速あり', toll:'有料回避', local:'下道優先' };
+const MODE_BTN  = { hwy:'mHwy', toll:'mToll', local:'mLoc' };
+
+function setMode(m) {
+  mode = m;
+  for (const k in MODE_BTN)
+    $(MODE_BTN[k]).setAttribute('aria-pressed', k === m ? 'true' : 'false');
+  localStorage.setItem('mode', m);
+  // ナビ中に変えたら、その場から引き直す
+  if (watchId !== null && dest) {
+    log('経路の種類を変更 → 再探索');
+    navigator.geolocation.getCurrentPosition(
+      p => route([p.coords.longitude, p.coords.latitude], dest).catch(e => log(e.message)),
+      e => log('GPS: ' + e.message), { enableHighAccuracy:true, timeout:15000 });
+  }
+}
+
+$('dest').value     = localStorage.getItem('dest') || '';
+$('valhalla').value = localStorage.getItem('valhalla') || '';
+for (const k in MODE_BTN) $(MODE_BTN[k]).onclick = () => setMode(k);
+setMode(localStorage.getItem('mode') || 'hwy');
 
 $('btnBle').onclick = async () => {
   try { await bleConnect(); $('btnGo').disabled = false; }
@@ -252,7 +328,7 @@ $('btnGo').onclick = async () => {
   const q = $('dest').value.trim();
   if (!q) return log('目的地を入れてください');
   localStorage.setItem('dest', q);
-  localStorage.setItem('osrm', $('osrm').value.trim());
+  localStorage.setItem('valhalla', $('valhalla').value.trim());
 
   $('btnGo').disabled = true;
   try {
