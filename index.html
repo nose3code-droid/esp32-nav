@@ -17,6 +17,16 @@
   button.sec { background:#1c1c1c; border-color:#444; }
   button.mode { background:#1c1c1c; border-color:#444; font-size:14px; padding:8px 4px; }
   button.mode[aria-pressed="true"] { background:#2a5db0; border-color:#2a5db0; }
+  #cands:empty { display:none; }
+  .cand { display:block; width:100%; text-align:left; background:#1c1c1c;
+          border:1px solid #333; border-radius:8px; padding:8px 10px; margin-bottom:6px;
+          font-size:14px; line-height:1.35; }
+  .cand em { font-style:normal; color:#6cf; float:right; margin-left:8px; }
+  .cand span { display:block; color:#888; font-size:12px;
+               overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  #picked { background:#0d2a4d; border:1px solid #2a5db0; border-radius:8px;
+            padding:8px 10px; margin-bottom:8px; font-size:14px; }
+  #picked.none { background:#1c1c1c; border-color:#444; color:#888; }
   #log { font:12px/1.4 ui-monospace,monospace; background:#000; color:#6f6;
          padding:8px; border-radius:8px; height:130px; overflow:auto; white-space:pre-wrap; }
   #hud { background:#000; border-radius:12px; padding:16px; text-align:center; margin:12px 0; }
@@ -37,7 +47,11 @@
 <h1>ESP32 Nav Bridge</h1>
 <p class="sub">Valhalla + Nominatim（APIキー不要）</p>
 
-<input id="dest" placeholder="目的地（例: 名古屋駅）">
+<input id="dest" placeholder="目的地（例: 名古屋駅 / セブンイレブン / ガソリンスタンド）">
+<button id="btnSearch" class="sec">現在地から検索</button>
+
+<div id="cands"></div>
+<div id="picked" class="none">目的地は未選択</div>
 
 <p class="label">経路の種類</p>
 <div class="row">
@@ -73,9 +87,9 @@
 <p><small>Bluefy で HTTPS 配信されたこのページを開いてください。file:// では動きません。</small></p>
 <footer>
   経路・地名データ © <a href="https://www.openstreetmap.org/copyright">OpenStreetMap contributors</a>（ODbL）。
-  経路探索は <a href="https://valhalla.github.io/valhalla/">Valhalla</a>（FOSSGIS 公開サーバ）、地名検索は
-  <a href="https://nominatim.org/">Nominatim</a> を利用しています。いずれも公共の無償サービスのため、
-  連続した大量アクセスは行わないでください。<br>
+  経路探索は <a href="https://valhalla.github.io/valhalla/">Valhalla</a>、地名・施設検索は
+  <a href="https://nominatim.org/">Nominatim</a>（いずれも FOSSGIS / OSMF の公共無償サーバ）
+  を利用しています。連続した大量アクセスは行わないでください。<br>
   「有料回避」「下道優先」は Valhalla の重み付け（優先度）です。禁止ではないため、
   他に道が無ければ高速や有料区間を通ることがあります。
 </footer>
@@ -142,6 +156,18 @@ function hav(a, b) {                     // a,b = [lon,lat]
   return 2 * R * Math.asin(Math.sqrt(s));
 }
 
+// 点 p から線分 ab までの距離[m]。数百m程度なので平面近似で十分
+function segDist(p, a, b) {
+  const kx = Math.cos(rad(p[1])) * 111320, ky = 110540;
+  const px = (p[0] - a[0]) * kx, py = (p[1] - a[1]) * ky;
+  const bx = (b[0] - a[0]) * kx, by = (b[1] - a[1]) * ky;
+  const L  = bx * bx + by * by;
+  let t = L ? (px * bx + py * by) / L : 0;
+  t = t < 0 ? 0 : t > 1 ? 1 : t;
+  const dx = px - bx * t, dy = py - by * t;
+  return Math.sqrt(dx * dx + dy * dy);
+}
+
 // Valhalla の shape は Encoded Polyline だが精度が 1e6（Google 形式は 1e5）
 function decodeShape(str, factor) {
   let i = 0, lat = 0, lon = 0;
@@ -177,9 +203,157 @@ const VTURN = {
 };
 const turnCode = m => VTURN[m.type] ?? T.STRAIGHT;
 
+/* ---------- 現在地 ---------- */
+// 検索も再探索も必ずここを基準にする（旧版は検索に現在地を渡していなかった）
+let curPos = null, curAt = 0, curAcc = 30;
+
+function setCur(p) {
+  curPos = [p.coords.longitude, p.coords.latitude];
+  curAt  = Date.now();
+  curAcc = p.coords.accuracy || 30;
+}
+
+function gps(maxAge = 20000) {
+  if (curPos && Date.now() - curAt < maxAge) return Promise.resolve(curPos);
+  return new Promise((res, rej) =>
+    navigator.geolocation.getCurrentPosition(
+      p => { setCur(p); res(curPos); },
+      e => rej(new Error('現在地が取れません: ' + e.message)),
+      { enableHighAccuracy:true, timeout:15000, maximumAge:5000 }));
+}
+
+/* ---------- 目的地検索 ---------- */
+// Nominatim は「コンビニ」「ガソリンスタンド」のような一般名詞を
+// カテゴリとして解釈できる（実測で機能）。効かないのは表記ゆれで、
+// 例えば OSM の店名は「セブン-イレブン」とハイフンが入るため
+// 「セブンイレブン」では当たらない。よく使う言い換えをここで吸収する
+const ALIAS = {
+  'セブンイレブン':'セブン-イレブン', 'セブン':'セブン-イレブン',
+  '7-11':'セブン-イレブン', '711':'セブン-イレブン',
+  'ファミマ':'ファミリーマート', 'ローソン100':'ローソンストア100',
+  'マック':'マクドナルド', 'マクド':'マクドナルド',
+  'ミスド':'ミスタードーナツ', 'ケンタ':'ケンタッキーフライドチキン',
+  'スタバ':'スターバックス', 'モス':'モスバーガー',
+  'コインパーキング':'駐車場', 'パーキング':'駐車場',
+  'ガススタ':'ガソリンスタンド', 'gs':'ガソリンスタンド',
+  'コンビニエンスストア':'コンビニ', 'ドラッグ':'ドラッグストア',
+  'クスリ':'ドラッグストア', 'ホムセン':'ホームセンター',
+  'sa':'サービスエリア', 'pa':'パーキングエリア'
+};
+const alias = q => ALIAS[q.trim().toLowerCase()] || ALIAS[q.trim()] || q.trim();
+
+// Nominatim は「1秒1リクエスト」の利用規約。半径を広げるたびに1回だけ呼ぶ。
+// viewbox+bounded で現在地周辺に限定する（旧版は全国から importance 順に1件だった）
+async function nominatim(q, c, radius) {
+  let extra = '';
+  if (radius) {
+    const dLat = radius / 111320;
+    const dLon = radius / (111320 * Math.cos(rad(c[1])) || 1);
+    extra = '&bounded=1&viewbox=' +
+      [c[0] - dLon, c[1] + dLat, c[0] + dLon, c[1] - dLat].map(v => v.toFixed(6)).join(',');
+  }
+  const u = NOMINATIM + '?q=' + encodeURIComponent(q)
+          + '&format=jsonv2&limit=20&countrycodes=jp&accept-language=ja'
+          + '&addressdetails=1' + extra;
+  try {
+    const r = await fetch(u, { headers:{ 'Accept':'application/json' } });
+    if (!r.ok) return [];
+    const j = await r.json();
+    return j.map(x => ({
+      name: x.name || x.display_name.split(',')[0],
+      sub:  x.display_name.split(',').slice(1, 4).join('').trim(),
+      lon:  parseFloat(x.lon), lat: parseFloat(x.lat)
+    }));
+  } catch (e) { return []; }
+}
+
+function merge(lists, c) {
+  const out = [], seen = new Set();
+  for (const it of [].concat(...lists)) {
+    const key = it.name + '@' + it.lon.toFixed(4) + ',' + it.lat.toFixed(4);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    it.dist = hav(c, [it.lon, it.lat]);
+    out.push(it);
+  }
+  return out.sort((a, b) => a.dist - b.dist).slice(0, 12);
+}
+
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+
+// 現在地の近くから順に半径を広げる。近所にあるものは必ず近所から出す
+async function searchPlaces(q, c) {
+  const t = alias(q);
+  if (t !== q.trim()) log('検索語を「' + t + '」として照会');
+  for (const m of [3000, 10000, 30000]) {
+    const res = merge([await nominatim(t, c, m)], c);
+    if (res.length) { log('該当 ' + res.length + '件（半径' + (m / 1000) + 'km）'); return res; }
+    await sleep(1100);                 // 1秒1リクエストの利用規約を守る
+  }
+  const far = merge([await nominatim(t, c, 0)], c);   // 最後は全国。ただし距離順
+  if (far.length) log('近くに無いため全国から ' + far.length + '件');
+  return far;
+}
+
+/* ---------- 検索UI ---------- */
+let dest = null, destName = '';
+
+const fmtKm = m => m >= 1000 ? (m / 1000).toFixed(1) + 'km' : Math.round(m) + 'm';
+
+function renderCands(list) {
+  const box = $('cands');
+  box.textContent = '';
+  for (const it of list) {
+    const b = document.createElement('button');
+    b.className = 'cand';
+    const em = document.createElement('em'); em.textContent = fmtKm(it.dist);
+    const sp = document.createElement('span'); sp.textContent = it.sub || '';
+    b.append(em, document.createTextNode(it.name), sp);
+    b.onclick = () => pick(it);
+    box.appendChild(b);
+  }
+}
+
+function pick(it) {
+  dest = [it.lon, it.lat];
+  destName = it.name;
+  $('picked').className = '';
+  $('picked').textContent = '目的地: ' + it.name + '（' + fmtKm(it.dist) + '）';
+  $('cands').textContent = '';
+  localStorage.setItem('destPick', JSON.stringify({ n:it.name, lon:it.lon, lat:it.lat }));
+  if (watchId !== null) {           // ナビ中に選び直したら即再探索
+    gps(0).then(c => reroute(c, '目的地を変更')).catch(e => log(e.message));
+  }
+}
+
+function clearPick() {
+  dest = null; destName = '';
+  $('picked').className = 'none';
+  $('picked').textContent = '目的地は未選択';
+  localStorage.removeItem('destPick');
+}
+
+async function doSearch() {
+  const q = $('dest').value.trim();
+  if (!q) return log('目的地を入れてください');
+  localStorage.setItem('dest', q);
+  $('btnSearch').disabled = true;
+  $('cands').textContent = '';
+  try {
+    const c = await gps(0);          // 常に「いまの現在地」を基準にする
+    log('検索中: ' + q);
+    const res = await searchPlaces(q, c);
+    if (!res.length) { log('見つかりません'); return; }
+    renderCands(res);
+    if (res.length === 1) pick(res[0]);
+  } catch (e) { log('検索失敗: ' + e.message); }
+  finally { $('btnSearch').disabled = false; }
+}
+
 /* ---------- 経路 ---------- */
-let steps = [], coords = [], idx = 0, minD = Infinity;
-let watchId = null, lastReroute = 0, wakeLock = null, dest = null;
+let steps = [], coords = [], idx = 0, minD = Infinity, snapIdx = 0;
+let watchId = null, lastReroute = 0, wakeLock = null;
+let offCnt = 0, rerouting = false;
 let mode = 'hwy';   // hwy | toll | local
 
 const vBase = () => ($('valhalla').value.trim() || VALHALLA_DEFAULT).replace(/\/+$/, '');
@@ -189,18 +363,6 @@ function costing() {
   if (mode === 'toll')  return { use_tolls: 0 };
   if (mode === 'local') return { use_highways: 0, use_tolls: 0 };
   return {};
-}
-
-// Nominatim は「1秒に1リクエストまで」の利用規約。出発時の1回だけ呼ぶ
-async function geocode(q) {
-  const u = NOMINATIM + '?q=' + encodeURIComponent(q)
-          + '&format=jsonv2&limit=1&countrycodes=jp&accept-language=ja';
-  const r = await fetch(u, { headers: { 'Accept': 'application/json' } });
-  if (!r.ok) throw new Error('地名検索に失敗 (' + r.status + ')');
-  const j = await r.json();
-  if (!j.length) throw new Error('目的地が見つかりません');
-  log('目的地: ' + j[0].display_name.split(',').slice(0, 3).join(','));
-  return [parseFloat(j[0].lon), parseFloat(j[0].lat)];
 }
 
 async function route(from, to) {
@@ -222,24 +384,52 @@ async function route(from, to) {
   // maneuver の座標は直接は入っておらず、shape のインデックスで示される
   for (const m of steps)
     m.loc = coords[Math.min(m.begin_shape_index, coords.length - 1)];
-  idx  = 0;
-  minD = Infinity;
+  idx = 0; minD = Infinity; snapIdx = 0; offCnt = 0;
 
   const s = j.trip.summary;
   log('経路取得[' + MODE_NAME[mode] + ']: ' + s.length.toFixed(1) + 'km / '
       + Math.round(s.time / 60) + '分 / ' + steps.length + 'ステップ');
 }
 
-function offRoute(pos) {
-  let min = Infinity;
-  for (const c of coords) { const d = hav(pos, c); if (d < min) min = d; }
-  return min > 80;
+// 経路「線分」への最短距離。頂点との距離だと直線区間で誤判定する
+function routeDist(pos) {
+  const n = coords.length - 1;
+  if (n < 1) return Infinity;
+  const scan = (lo, hi) => {
+    let min = Infinity, at = lo;
+    for (let i = lo; i < hi; i++) {
+      const d = segDist(pos, coords[i], coords[i + 1]);
+      if (d < min) { min = d; at = i; }
+    }
+    return [min, at];
+  };
+  // まず前回の位置の周辺だけ見る（長距離でも軽い／折返し路の誤マッチも防ぐ）
+  let [min, at] = scan(Math.max(0, snapIdx - 20), Math.min(n, snapIdx + 300));
+  if (min > 60) {                      // 見失ったら全体を探し直す
+    const [m2, a2] = scan(0, n);
+    if (m2 < min) { min = m2; at = a2; }
+  }
+  snapIdx = at;
+  return min;
+}
+
+async function reroute(pos, why) {
+  if (!dest || rerouting) return;
+  rerouting = true;
+  lastReroute = Date.now();
+  log(why + ' → 再探索');
+  try { await route(pos, dest); }
+  catch (e) {
+    log('再探索失敗: ' + e.message);
+    lastReroute = Date.now() - 12000;   // 失敗時は約8秒後に再試行
+  }
+  rerouting = false;
 }
 
 // 区間を進める。「25m以内に入った」だけでなく
 // 「一度50m以内に近づいてから30m以上遠ざかった＝通過した」でも次へ送る
 function advance(pos) {
-  while (idx + 1 < steps.length - 1) {
+  while (idx + 2 < steps.length) {     // 最後の「到着」は通過判定しない
     const d = hav(pos, steps[idx + 1].loc);
     if (d < minD) minD = d;
     if (d < 25 || (minD < 50 && d > minD + 30)) { idx++; minD = Infinity; }
@@ -267,14 +457,18 @@ function hud(turn, dist, eta, road) {
 }
 
 function onFix(p) {
+  setCur(p);
   if (!steps.length) return;
-  const pos = [p.coords.longitude, p.coords.latitude];
+  const pos = curPos;
 
-  if (offRoute(pos) && Date.now() - lastReroute > 20000) {
-    lastReroute = Date.now();
-    log('ルート外 → 再探索');
-    route(pos, dest).catch(e => log(e.message));
-    return;
+  // GPS 精度が悪いほど閾値を広げる。3回続けて外れたら本物とみなす
+  const thr = Math.max(60, Math.min(150, curAcc * 2.5));
+  const off = routeDist(pos);
+  if (off > thr) offCnt++; else offCnt = 0;
+
+  if (offCnt >= 3 && !rerouting && Date.now() - lastReroute > 20000) {
+    offCnt = 0;
+    reroute(pos, 'ルート外 ' + Math.round(off) + 'm');
   }
 
   advance(pos);
@@ -301,18 +495,24 @@ function setMode(m) {
     $(MODE_BTN[k]).setAttribute('aria-pressed', k === m ? 'true' : 'false');
   localStorage.setItem('mode', m);
   // ナビ中に変えたら、その場から引き直す
-  if (watchId !== null && dest) {
-    log('経路の種類を変更 → 再探索');
-    navigator.geolocation.getCurrentPosition(
-      p => route([p.coords.longitude, p.coords.latitude], dest).catch(e => log(e.message)),
-      e => log('GPS: ' + e.message), { enableHighAccuracy:true, timeout:15000 });
-  }
+  if (watchId !== null && dest)
+    gps(0).then(c => reroute(c, '経路の種類を変更')).catch(e => log(e.message));
 }
 
 $('dest').value     = localStorage.getItem('dest') || '';
 $('valhalla').value = localStorage.getItem('valhalla') || '';
+try {
+  const s = JSON.parse(localStorage.getItem('destPick') || 'null');
+  if (s) { dest = [s.lon, s.lat]; destName = s.n;
+           $('picked').className = ''; $('picked').textContent = '目的地: ' + s.n; }
+} catch (e) {}
+
 for (const k in MODE_BTN) $(MODE_BTN[k]).onclick = () => setMode(k);
 setMode(localStorage.getItem('mode') || 'hwy');
+
+// 入力を変えたら前の選択は無効にする（古い目的地のままナビ開始するのを防ぐ）
+$('dest').oninput = () => { if (dest) clearPick(); };
+$('btnSearch').onclick = doSearch;
 
 $('btnBle').onclick = async () => {
   try { await bleConnect(); $('btnGo').disabled = false; }
@@ -325,18 +525,12 @@ $('btnTest').onclick = () => {
 };
 
 $('btnGo').onclick = async () => {
-  const q = $('dest').value.trim();
-  if (!q) return log('目的地を入れてください');
-  localStorage.setItem('dest', q);
+  if (!dest) { log('先に「現在地から検索」で目的地を選んでください'); return doSearch(); }
   localStorage.setItem('valhalla', $('valhalla').value.trim());
 
   $('btnGo').disabled = true;
   try {
-    const here = await new Promise((res, rej) =>
-      navigator.geolocation.getCurrentPosition(res, rej,
-        { enableHighAccuracy:true, timeout:15000 }));
-    const from = [here.coords.longitude, here.coords.latitude];
-    dest = await geocode(q);
+    const from = await gps(0);
     await route(from, dest);
 
     try { wakeLock = await navigator.wakeLock.request('screen'); log('画面ロック抑止 ON'); }
@@ -346,7 +540,7 @@ $('btnGo').onclick = async () => {
                 e => log('GPS: ' + e.message),
                 { enableHighAccuracy:true, maximumAge:1000, timeout:20000 });
     $('btnStop').disabled = false;
-    log('ナビ開始');
+    log('ナビ開始: ' + destName);
   } catch (e) {
     log('エラー: ' + e.message);
     $('btnGo').disabled = false;
@@ -357,7 +551,7 @@ $('btnStop').onclick = () => {
   if (watchId !== null) navigator.geolocation.clearWatch(watchId);
   watchId = null;
   if (wakeLock) { wakeLock.release(); wakeLock = null; }
-  steps = []; coords = [];
+  steps = []; coords = []; offCnt = 0;
   send(255, 0, 0, '');
   $('btnStop').disabled = true;
   $('btnGo').disabled   = false;
